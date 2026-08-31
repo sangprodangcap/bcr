@@ -1,0 +1,17 @@
+{
+  "name": "baccarat-predictor",
+  "version": "4.0.0",
+  "description": "Baccarat Predictor v4 - @sewdangcap",
+  "main": "baccarat_bot.js",
+  "scripts": {
+    "start": "node baccarat_bot.js"
+  },
+  "dependencies": {
+    "node-fetch": "^2.7.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "author": "@sewdangcap",
+  "license": "ISC"
+}
