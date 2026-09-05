@@ -6,11 +6,13 @@ const http  = require('http');
 const fetch = require('node-fetch');
 
 // ============================================
-// API SOURCE - V1 (primary) + V2 (fallback)
+// API SOURCE
+// V2 = primary  (có results BPT đầy đủ)
+// V1 = fallback (chỉ có last_5, 5 phiên)
 // ============================================
+const API_V2_ALL   = 'https://defining-continues-defendant-thorough.trycloudflare.com/api/bcr';
 const API_V1_ALL   = 'https://referrals-episode-geography-mind.trycloudflare.com/api/bcr/all';
 const API_V1_TABLE = 'https://referrals-episode-geography-mind.trycloudflare.com/api/bcr/';
-const API_V2_ALL   = 'https://defining-continues-defendant-thorough.trycloudflare.com/api/bcr';
 
 const PORT = process.env.PORT || 3000;
 
@@ -72,88 +74,114 @@ async function safeFetch(url) {
 }
 
 // ============================================
-// NORMALIZE - chuan hoa du lieu tu V1 hoac V2
+// CONVERT last_5 array → chuoi BPT ngan
+// V1 single ban: last_5: [{winner:"Banker"/"Player"/"Tie"}]
 // ============================================
-function normalizeItems(json, source) {
-  if (!json) return null;
-
-  // V2: { du_lieu: [...] } hoac { data: [...] }
-  if (source === 'V2') {
-    const arr = json.du_lieu || json.data || (Array.isArray(json) ? json : null);
-    if (!Array.isArray(arr)) return null;
-    return arr.map(item => ({
-      table_name:  item.ban  || item.table_name || '',
-      result:      item.lich_su || item.result  || '',
-      round:       item.phien   || item.round   || null,
-      dealer_name: item.dealer  || item.dealer_name || '',
-    }));
-  }
-
-  // V1: array thang hoac { data: [...] }
-  const arr = Array.isArray(json) ? json : (json.data || json.du_lieu || null);
-  if (!Array.isArray(arr)) return null;
-  return arr.map(item => ({
-    table_name:  item.table_name || item.ban || String(item.id || ''),
-    result:      item.result     || item.lich_su || '',
-    round:       item.round      || item.phien   || null,
-    dealer_name: item.dealer_name || item.dealer || '',
-  }));
+function last5ToBPT(last5) {
+  if (!Array.isArray(last5)) return '';
+  return last5.map(x => {
+    const w = (x.winner || '').toLowerCase();
+    if (w === 'banker') return 'B';
+    if (w === 'player') return 'P';
+    if (w === 'tie')    return 'T';
+    return '';
+  }).filter(Boolean).join('');
 }
 
 // ============================================
-// FETCH ALL - thu V1 truoc, fallback V2
+// NORMALIZE V2 data array → shape chuan
+// V2: { code, data: [{ban, results, good_road, update_at}], message }
+// ============================================
+function normalizeV2(json) {
+  if (!json) return null;
+  const arr = json.data || json.du_lieu || (Array.isArray(json) ? json : null);
+  if (!Array.isArray(arr) || arr.length === 0) return null;
+  return arr.map(item => ({
+    table_name:  String(item.ban || item.table_name || '').trim(),
+    result:      String(item.results || item.result || '').replace(/[^BPTbpt]/g, '').toUpperCase(),
+    round:       item.phien   || null,
+    dealer_name: item.dealer  || item.dealer_name || '',
+  })).filter(x => x.table_name);
+}
+
+// ============================================
+// NORMALIZE V1 /all array → shape chuan (no BPT history)
+// V1 all: [{ban, history_count, ket_qua_du_doan, ket_qua_truoc, phien}]
+// NOTE: V1/all khong co chuoi BPT, chi dung de lay danh sach ban
+// ============================================
+function normalizeV1All(json) {
+  if (!Array.isArray(json)) return null;
+  return json.map(item => ({
+    table_name:  String(item.ban || '').trim(),
+    result:      '',   // V1/all khong co history BPT
+    round:       item.phien || null,
+    dealer_name: item.dealer_name || '',
+  })).filter(x => x.table_name);
+}
+
+// ============================================
+// FETCH ALL - V2 primary, V1 fallback
 // ============================================
 async function fetchAll() {
-  // --- V1 ---
-  const v1 = await safeFetch(API_V1_ALL);
-  const v1Items = normalizeItems(v1, 'V1');
-  if (v1Items && v1Items.length > 0) {
-    console.log(`[SOURCE] V1 OK — ${v1Items.length} bàn`);
-    return { items: v1Items, source: 'V1' };
-  }
-
-  // --- V2 fallback ---
+  // --- V2 primary ---
   const v2 = await safeFetch(API_V2_ALL);
-  const v2Items = normalizeItems(v2, 'V2');
+  const v2Items = normalizeV2(v2);
   if (v2Items && v2Items.length > 0) {
-    console.log(`[SOURCE] V2 fallback — ${v2Items.length} bàn`);
+    console.log(`[SOURCE] V2 primary OK — ${v2Items.length} ban`);
     return { items: v2Items, source: 'V2' };
   }
 
-  console.warn('[SOURCE] Cả V1 lẫn V2 đều không phản hồi.');
-  return null;
+  // --- V1 fallback: lay danh sach ban, sau do fetch tung ban lay last_5 ---
+  console.warn('[SOURCE] V2 fail — thu V1 fallback');
+  const v1All = await safeFetch(API_V1_ALL);
+  const v1List = normalizeV1All(v1All);
+  if (!v1List || v1List.length === 0) {
+    console.error('[SOURCE] V1 cung fail. Khong co du lieu.');
+    return null;
+  }
+
+  // Fetch tung ban song song, lay last_5
+  const fetched = await Promise.all(
+    v1List.map(async item => {
+      const single = await safeFetch(API_V1_TABLE + encodeURIComponent(item.table_name));
+      if (!single) return item;
+      return {
+        ...item,
+        result:      last5ToBPT(single.last_5),
+        round:       single.phien || item.round || null,
+        dealer_name: single.summary ? (single.summary.dealer || '') : '',
+      };
+    })
+  );
+
+  console.log(`[SOURCE] V1 fallback OK — ${fetched.length} ban (last_5 only)`);
+  return { items: fetched, source: 'V1-fallback' };
 }
 
 // ============================================
-// FETCH SINGLE TABLE - thu V1 truoc, fallback V2
+// FETCH SINGLE TABLE
 // ============================================
 async function fetchSingle(banId) {
-  // V1
-  const v1 = await safeFetch(API_V1_TABLE + encodeURIComponent(banId));
-  if (v1 && (v1.result || v1.lich_su)) {
-    return {
-      result:      String(v1.result || v1.lich_su || ''),
-      round:       v1.round      || v1.phien     || null,
-      dealer_name: v1.dealer_name || v1.dealer   || '',
-      source: 'V1',
-    };
-  }
-
-  // V2: phai loc tu all
+  // Thu V2 truoc: loc tu all
   const v2All = await safeFetch(API_V2_ALL);
-  const v2Items = normalizeItems(v2All, 'V2');
+  const v2Items = normalizeV2(v2All);
   if (v2Items) {
     const found = v2Items.find(x =>
-      String(x.table_name).trim().toLowerCase() === String(banId).trim().toLowerCase()
+      x.table_name.toLowerCase() === String(banId).trim().toLowerCase()
     );
-    if (found) {
-      return {
-        result:      String(found.result || ''),
-        round:       found.round       || null,
-        dealer_name: found.dealer_name || '',
-        source: 'V2',
-      };
-    }
+    if (found && found.result) return { ...found, source: 'V2' };
+  }
+
+  // V1 single
+  const v1 = await safeFetch(API_V1_TABLE + encodeURIComponent(banId));
+  if (v1 && v1.last_5) {
+    return {
+      table_name:  String(v1.table || banId),
+      result:      last5ToBPT(v1.last_5),
+      round:       v1.phien || null,
+      dealer_name: v1.summary ? (v1.summary.dealer || '') : '',
+      source:      'V1-single',
+    };
   }
 
   return null;
@@ -193,7 +221,6 @@ function buildBigRoadGrid(raw) {
   const beadOnly = [...raw].filter(x => x !== 'T');
   const grid = [];
   let curSide = null, col = -1, row = 0, colObj = null;
-
   for (const ch of beadOnly) {
     if (ch !== curSide) {
       col++; row = 0; curSide = ch;
@@ -280,7 +307,7 @@ function predictDerived(cols, offset) {
 }
 
 // ============================================
-// 5-10. SIGNALS (unchanged)
+// 5-10. SIGNALS
 // ============================================
 function patternSignal(cols) {
   if (cols.length < 2) return null;
@@ -480,7 +507,7 @@ function tag(signal, rel) {
 }
 
 // ============================================
-// FETCH & CACHE - dung fetchAll() moi
+// FETCH & CACHE
 // ============================================
 async function fetchAndCache() {
   if (isFetching) return false;
@@ -536,8 +563,8 @@ async function fetchAndCache() {
       updateCount++;
       const ts = new Date(lastFetch).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
       console.log(
-        '[' + ts + '] [UPDATE #' + updateCount + '] fetch #' + fetchCount +
-        ' | tong ban: ' + banList.length + ' | source: ' + source
+        `[${ts}] [UPDATE #${updateCount}] fetch #${fetchCount}` +
+        ` | tong ban: ${banList.length} | source: ${source}`
       );
     }
   } catch (err) {
@@ -641,10 +668,10 @@ const server = http.createServer(async function (req, res) {
       update_count:      updateCount,
       last_fetch_ago_ms: Date.now() - lastFetch,
       sources: {
-        v1_all:   API_V1_ALL,
-        v1_table: API_V1_TABLE + ':ban',
-        v2_all:   API_V2_ALL,
-        priority: 'V1 → V2 fallback',
+        v2_primary: API_V2_ALL,
+        v1_all:     API_V1_ALL,
+        v1_table:   API_V1_TABLE + ':ban',
+        priority:   'V2 → V1 fallback (last_5 only)',
       },
       algorithm: 'BCR-V10-MULTISIGNAL',
     });
@@ -654,15 +681,13 @@ const server = http.createServer(async function (req, res) {
 });
 
 server.listen(PORT, function () {
-  console.log('\n=== BACCARAT BOT v10 - Dual Source (V1 + V2 Fallback) ===');
-  console.log('V1 All      : ' + API_V1_ALL);
-  console.log('V1 Table    : ' + API_V1_TABLE + ':ban');
-  console.log('V2 All      : ' + API_V2_ALL);
-  console.log('Priority    : V1 first → V2 fallback nếu V1 chết');
-  console.log('Thuat toan  : Pattern + BigEye + Small + Cockroach + Streak + Zigzag + Bead20 + Markov');
+  console.log('\n=== BACCARAT BOT v10 - V2 Primary + V1 Fallback ===');
+  console.log('V2 Primary  : ' + API_V2_ALL + '  ← results BPT day du');
+  console.log('V1 Fallback : ' + API_V1_ALL + ' (last_5 only, 5 phien)');
+  console.log('Thuat toan  : Pattern+BigEye+Small+Cockroach+Streak+Zigzag+Bead20+Markov');
   console.log('Routes:');
   console.log('  GET /api/bcr         -> toan bo ban');
   console.log('  GET /api/bcr/:ban    -> chi tiet + so_do_cau');
-  console.log('  GET /health          -> trang thai + nguon\n');
+  console.log('  GET /health          -> trang thai\n');
   loop();
 });
