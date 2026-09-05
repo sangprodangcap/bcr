@@ -6,11 +6,11 @@ const http  = require('http');
 const fetch = require('node-fetch');
 
 // ============================================
-// API SOURCE
+// API SOURCE - V1 (primary) + V2 (fallback)
 // ============================================
-const API_BASE  = 'https://command-increasingly-trinity-powered.trycloudflare.com';
-const API_ALL   = API_BASE + '/data';
-const API_TABLE = API_BASE + '/data/';
+const API_V1_ALL   = 'https://referrals-episode-geography-mind.trycloudflare.com/api/bcr/all';
+const API_V1_TABLE = 'https://referrals-episode-geography-mind.trycloudflare.com/api/bcr/';
+const API_V2_ALL   = 'https://defining-continues-defendant-thorough.trycloudflare.com/api/bcr';
 
 const PORT = process.env.PORT || 3000;
 
@@ -72,7 +72,95 @@ async function safeFetch(url) {
 }
 
 // ============================================
-// 1. BIG ROAD - CAU TRUC LOGIC
+// NORMALIZE - chuan hoa du lieu tu V1 hoac V2
+// ============================================
+function normalizeItems(json, source) {
+  if (!json) return null;
+
+  // V2: { du_lieu: [...] } hoac { data: [...] }
+  if (source === 'V2') {
+    const arr = json.du_lieu || json.data || (Array.isArray(json) ? json : null);
+    if (!Array.isArray(arr)) return null;
+    return arr.map(item => ({
+      table_name:  item.ban  || item.table_name || '',
+      result:      item.lich_su || item.result  || '',
+      round:       item.phien   || item.round   || null,
+      dealer_name: item.dealer  || item.dealer_name || '',
+    }));
+  }
+
+  // V1: array thang hoac { data: [...] }
+  const arr = Array.isArray(json) ? json : (json.data || json.du_lieu || null);
+  if (!Array.isArray(arr)) return null;
+  return arr.map(item => ({
+    table_name:  item.table_name || item.ban || String(item.id || ''),
+    result:      item.result     || item.lich_su || '',
+    round:       item.round      || item.phien   || null,
+    dealer_name: item.dealer_name || item.dealer || '',
+  }));
+}
+
+// ============================================
+// FETCH ALL - thu V1 truoc, fallback V2
+// ============================================
+async function fetchAll() {
+  // --- V1 ---
+  const v1 = await safeFetch(API_V1_ALL);
+  const v1Items = normalizeItems(v1, 'V1');
+  if (v1Items && v1Items.length > 0) {
+    console.log(`[SOURCE] V1 OK — ${v1Items.length} bàn`);
+    return { items: v1Items, source: 'V1' };
+  }
+
+  // --- V2 fallback ---
+  const v2 = await safeFetch(API_V2_ALL);
+  const v2Items = normalizeItems(v2, 'V2');
+  if (v2Items && v2Items.length > 0) {
+    console.log(`[SOURCE] V2 fallback — ${v2Items.length} bàn`);
+    return { items: v2Items, source: 'V2' };
+  }
+
+  console.warn('[SOURCE] Cả V1 lẫn V2 đều không phản hồi.');
+  return null;
+}
+
+// ============================================
+// FETCH SINGLE TABLE - thu V1 truoc, fallback V2
+// ============================================
+async function fetchSingle(banId) {
+  // V1
+  const v1 = await safeFetch(API_V1_TABLE + encodeURIComponent(banId));
+  if (v1 && (v1.result || v1.lich_su)) {
+    return {
+      result:      String(v1.result || v1.lich_su || ''),
+      round:       v1.round      || v1.phien     || null,
+      dealer_name: v1.dealer_name || v1.dealer   || '',
+      source: 'V1',
+    };
+  }
+
+  // V2: phai loc tu all
+  const v2All = await safeFetch(API_V2_ALL);
+  const v2Items = normalizeItems(v2All, 'V2');
+  if (v2Items) {
+    const found = v2Items.find(x =>
+      String(x.table_name).trim().toLowerCase() === String(banId).trim().toLowerCase()
+    );
+    if (found) {
+      return {
+        result:      String(found.result || ''),
+        round:       found.round       || null,
+        dealer_name: found.dealer_name || '',
+        source: 'V2',
+      };
+    }
+  }
+
+  return null;
+}
+
+// ============================================
+// 1. BIG ROAD
 // ============================================
 function buildBigRoad(raw) {
   const cols = [];
@@ -99,7 +187,7 @@ function buildBigRoad(raw) {
 }
 
 // ============================================
-// 2. BIG ROAD GRID - BANG VE THAT (6 hang + duoi rong)
+// 2. BIG ROAD GRID
 // ============================================
 function buildBigRoadGrid(raw) {
   const beadOnly = [...raw].filter(x => x !== 'T');
@@ -123,7 +211,7 @@ function buildBigRoadGrid(raw) {
 }
 
 // ============================================
-// 3. BEAD PLATE - BANG CAU HAT (6 hang)
+// 3. BEAD PLATE
 // ============================================
 function buildBeadGrid(raw) {
   const cells = [];
@@ -142,7 +230,7 @@ function buildBeadGrid(raw) {
 }
 
 // ============================================
-// 4. DERIVED ROADS (Big Eye=1, Small=2, Cockroach=3)
+// 4. DERIVED ROADS
 // ============================================
 function buildDerived(cols, offset) {
   const out = [];
@@ -192,7 +280,7 @@ function predictDerived(cols, offset) {
 }
 
 // ============================================
-// 5. TIN HIEU: MAU BIG ROAD
+// 5-10. SIGNALS (unchanged)
 // ============================================
 function patternSignal(cols) {
   if (cols.length < 2) return null;
@@ -240,9 +328,6 @@ function patternSignal(cols) {
   return null;
 }
 
-// ============================================
-// 6. TIN HIEU: DERIVED ROADS
-// ============================================
 function derivedSignal(cols, offset, key, label) {
   if (cols.length < offset + 2) return null;
   const pred = predictDerived(cols, offset);
@@ -250,13 +335,9 @@ function derivedSignal(cols, offset, key, label) {
   return { name: label, side: pred, strength: 0.75 };
 }
 
-// ============================================
-// 7. TIN HIEU: STREAK - xac suat gay tu lich su that
-// ============================================
 function streakSignal(beadOnly) {
   const n = beadOnly.length;
   if (n < CFG.STREAK_MIN) return null;
-
   const last = beadOnly[n - 1];
   let len = 1;
   while (len < n && beadOnly[n - 1 - len] === last) len++;
@@ -283,9 +364,6 @@ function streakSignal(beadOnly) {
   };
 }
 
-// ============================================
-// 8. TIN HIEU: ZIGZAG
-// ============================================
 function zigzagSignal(beadOnly) {
   if (beadOnly.length < 4) return null;
   const tail4 = beadOnly.slice(-4);
@@ -295,9 +373,6 @@ function zigzagSignal(beadOnly) {
   return { name: 'Zigzag 1-1', side: opp, strength: 0.6 };
 }
 
-// ============================================
-// 9. TIN HIEU: BEAD 20
-// ============================================
 function bead20Signal(beadOnly) {
   const bead = beadOnly.slice(-CFG.BEAD_WINDOW);
   if (bead.length < 10) return null;
@@ -311,9 +386,6 @@ function bead20Signal(beadOnly) {
   };
 }
 
-// ============================================
-// 10. TIN HIEU: MARKOV BAC 1
-// ============================================
 function markovSignal(beadOnly) {
   const n = beadOnly.length;
   if (n < 12) return null;
@@ -335,7 +407,7 @@ function markovSignal(beadOnly) {
 }
 
 // ============================================
-// TONG HOP - 1 CO CHE CHAM DIEM DUY NHAT
+// COMBINE
 // ============================================
 function combine(signals) {
   const votes = signals.filter(Boolean);
@@ -363,7 +435,7 @@ function combine(signals) {
 }
 
 // ============================================
-// ANALYZE TONG HOP CHO 1 BAN
+// ANALYZE
 // ============================================
 function analyze(rawHistory) {
   const raw      = (rawHistory || '').toUpperCase().replace(/[^BPT]/g, '');
@@ -376,14 +448,14 @@ function analyze(rawHistory) {
   const cols = buildBigRoad(raw);
 
   const signals = [
-    tag(patternSignal(cols),                                    'PATTERN'),
-    tag(derivedSignal(cols, 1, 'BIG_EYE',   'Big Eye Boy'),   'BIG_EYE'),
-    tag(derivedSignal(cols, 2, 'SMALL',     'Small Road'),    'SMALL'),
-    tag(derivedSignal(cols, 3, 'COCKROACH', 'Cockroach Road'),'COCKROACH'),
-    tag(streakSignal(beadOnly),                                 'STREAK'),
-    tag(zigzagSignal(beadOnly),                                 'ZIGZAG'),
-    tag(bead20Signal(beadOnly),                                 'BEAD20'),
-    tag(markovSignal(beadOnly),                                 'MARKOV'),
+    tag(patternSignal(cols),                                     'PATTERN'),
+    tag(derivedSignal(cols, 1, 'BIG_EYE',   'Big Eye Boy'),    'BIG_EYE'),
+    tag(derivedSignal(cols, 2, 'SMALL',     'Small Road'),     'SMALL'),
+    tag(derivedSignal(cols, 3, 'COCKROACH', 'Cockroach Road'), 'COCKROACH'),
+    tag(streakSignal(beadOnly),                                  'STREAK'),
+    tag(zigzagSignal(beadOnly),                                  'ZIGZAG'),
+    tag(bead20Signal(beadOnly),                                  'BEAD20'),
+    tag(markovSignal(beadOnly),                                  'MARKOV'),
   ];
 
   const result = combine(signals);
@@ -408,7 +480,7 @@ function tag(signal, rel) {
 }
 
 // ============================================
-// FETCH & CACHE
+// FETCH & CACHE - dung fetchAll() moi
 // ============================================
 async function fetchAndCache() {
   if (isFetching) return false;
@@ -417,14 +489,15 @@ async function fetchAndCache() {
   let hasNew = false;
 
   try {
-    const allJson = await safeFetch(API_ALL);
-    if (!Array.isArray(allJson)) { isFetching = false; return false; }
+    const fetched = await fetchAll();
+    if (!fetched) { isFetching = false; return false; }
 
+    const { items, source } = fetched;
     const banList  = cache ? [...cache] : [];
     const banIndex = {};
     banList.forEach((b, i) => { banIndex[b.ban] = i; });
 
-    for (const item of allJson) {
+    for (const item of items) {
       const ban    = String(item.table_name).trim();
       const result = String(item.result || '');
 
@@ -442,6 +515,7 @@ async function fetchAndCache() {
         do_tin_cay: a.do_tin_cay,
         good_road:  a.cau_dep,
         notes:      a.notes,
+        source,
         updated_at: Date.now(),
       };
 
@@ -463,7 +537,7 @@ async function fetchAndCache() {
       const ts = new Date(lastFetch).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
       console.log(
         '[' + ts + '] [UPDATE #' + updateCount + '] fetch #' + fetchCount +
-        ' | tong ban: ' + banList.length
+        ' | tong ban: ' + banList.length + ' | source: ' + source
       );
     }
   } catch (err) {
@@ -521,18 +595,19 @@ const server = http.createServer(async function (req, res) {
     let rawResult = lastResultStr.get(banId);
 
     if (!item) {
-      const single = await safeFetch(API_TABLE + encodeURIComponent(banId));
-      if (single && single.result) {
-        rawResult = String(single.result);
+      const single = await fetchSingle(banId);
+      if (single) {
+        rawResult = single.result;
         const a = analyze(rawResult);
         item = {
           ban:        banId,
-          phien:      single.round || null,
+          phien:      single.round       || null,
           dealer:     single.dealer_name || '',
           du_doan:    a.du_doan,
           do_tin_cay: a.do_tin_cay,
           good_road:  a.cau_dep,
           notes:      a.notes,
+          source:     single.source,
           updated_at: Date.now(),
         };
       }
@@ -565,7 +640,13 @@ const server = http.createServer(async function (req, res) {
       fetch_count:       fetchCount,
       update_count:      updateCount,
       last_fetch_ago_ms: Date.now() - lastFetch,
-      algorithm:         'BCR-V10-MULTISIGNAL',
+      sources: {
+        v1_all:   API_V1_ALL,
+        v1_table: API_V1_TABLE + ':ban',
+        v2_all:   API_V2_ALL,
+        priority: 'V1 → V2 fallback',
+      },
+      algorithm: 'BCR-V10-MULTISIGNAL',
     });
   }
 
@@ -573,14 +654,15 @@ const server = http.createServer(async function (req, res) {
 });
 
 server.listen(PORT, function () {
-  console.log('\n=== BACCARAT BOT v10 - Multi-Signal + Road Grid ===');
-  console.log('Data API    : ' + API_ALL);
-  console.log('Table API   : ' + API_TABLE + ':id');
+  console.log('\n=== BACCARAT BOT v10 - Dual Source (V1 + V2 Fallback) ===');
+  console.log('V1 All      : ' + API_V1_ALL);
+  console.log('V1 Table    : ' + API_V1_TABLE + ':ban');
+  console.log('V2 All      : ' + API_V2_ALL);
+  console.log('Priority    : V1 first → V2 fallback nếu V1 chết');
   console.log('Thuat toan  : Pattern + BigEye + Small + Cockroach + Streak + Zigzag + Bead20 + Markov');
-  console.log('Hop nhat    : 1 co che cham diem (RELIABILITY x strength), tran ' + CFG.CONF_MAX + '%');
   console.log('Routes:');
   console.log('  GET /api/bcr         -> toan bo ban');
   console.log('  GET /api/bcr/:ban    -> chi tiet + so_do_cau');
-  console.log('  GET /health          -> trang thai\n');
+  console.log('  GET /health          -> trang thai + nguon\n');
   loop();
 });
